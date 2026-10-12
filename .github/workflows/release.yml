@@ -1,0 +1,109 @@
+
+name: Diabetes ML Release
+
+# Run when a version tag is pushed
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Download repository code
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Prepare Python
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # Install dependencies
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      # Check code quality
+      - name: Lint code
+        run: python -m ruff check .
+
+      # Train and evaluate the model
+      - name: Train model
+        run: python train.py
+
+      # Run automated tests
+      - name: Test API
+        run: python -m pytest tests/ -v
+
+      - name: Verify version in metrics
+        run: |
+          python -c 'import json, os; assert json.load(open("artifacts/metrics.json"))["model_version"] == os.environ["GITHUB_REF_NAME"]'
+
+      # Prepare GHCR image name
+      - name: Set image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+
+      # Build Docker image
+      - name: Build Docker image
+        run: docker build --build-arg MODEL_VERSION="$GITHUB_REF_NAME" -t "$IMAGE" .
+
+      # Test the actual running container
+      - name: Run container smoke tests
+        run: |
+          docker run -d --name diabetes-smoke -p 127.0.0.1:8080:80 "$IMAGE"
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          curl -fsS http://127.0.0.1:8080/health | jq -e --arg version "$GITHUB_REF_NAME" '.status == "ok" and .model_version == $version'
+
+          valid='{"age":0.02,"sex":-0.044,"bmi":0.06,"bp":-0.03,"s1":-0.02,"s2":0.03,"s3":-0.02,"s4":0.02,"s5":0.02,"s6":-0.001}'
+          curl -fsS -X POST http://127.0.0.1:8080/predict -H 'Content-Type: application/json' -d "$valid" | jq -e '.prediction | type == "number"'
+
+          invalid='{"age":0.02,"sex":-0.044,"bmi":0.06,"bp":-0.03,"s1":-0.02,"s2":0.03,"s3":-0.02,"s4":0.02,"s5":0.02}'
+          status=$(curl -sS -o /tmp/invalid.json -w '%{http_code}' -X POST http://127.0.0.1:8080/predict -H 'Content-Type: application/json' -d "$invalid")
+
+          test "$status" = "422"
+          jq -e 'any(.detail[]; .loc[-1] == "s6")' /tmp/invalid.json
+
+      - name: Stop test container
+        if: always()
+        run: docker rm -f diabetes-smoke || true
+
+      # Authenticate with GitHub Container Registry
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Publish the image
+      - name: Publish Docker image
+        run: docker push "$IMAGE"
+
+      # Publish GitHub Release with metrics
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "# ${GITHUB_REF_NAME}"
+            echo
+            echo '## Training metrics'
+            echo '```json'
+            cat artifacts/metrics.json
+            echo '```'
+            echo
+            echo '## Changelog'
+            cat CHANGELOG.md
+          } > release-notes.md
+
+          gh release create "$GITHUB_REF_NAME" artifacts/metrics.json --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-notes.md
